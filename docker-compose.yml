@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    container_name: banking-backend-1
+    restart: always
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: 4000
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank
+      JWT_SECRET: supersecret123
+    depends_on:
+      - postgres
+      - ml-service
+      
+  worker:
+    build: ./backend
+    container_name: banking-worker
+    restart: always
+    command: ["node", "worker/processor.js"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank
+    depends_on:
+      - postgres
+      - ml-service
+      
+  ml-service:
+    build: ./backend/ml-service
+    container_name: ml-fraud
+    restart: always
+    ports:
+      - "8001:8001"
+
+  postgres:
+    image: postgres:15
+    container_name: banking-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: bank
+    volumes:
+     - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql
+     - ./migrations/003_otp_requests.sql:/docker-entrypoint-initdb.d/003_otp_requests.sql
+     - ./migrations/004_fraud_scores.sql:/docker-entrypoint-initdb.d/004_fraud_scores.sql
+     - ./migrations/005_fraud_alerts.sql:/docker-entrypoint-initdb.d/005_fraud_alerts.sql
+     - ./migrations/006_audit_logs.sql:/docker-entrypoint-initdb.d/006_audit_logs.sql
