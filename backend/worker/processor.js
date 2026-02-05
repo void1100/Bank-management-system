@@ -9,7 +9,7 @@ const pool = new Pool({
 });
 
 // ------------------------------------------------------
-// ML Microservice Call
+// ML CALL
 // ------------------------------------------------------
 async function getMLScore(event) {
   try {
@@ -25,57 +25,75 @@ async function getMLScore(event) {
     );
 
     return mlRes.data.score;
-  } catch (err) {
-    console.log("⚠ ML service unavailable — using fallback rules.");
+  } catch {
+    console.log("⚠ ML unavailable — fallback rules only.");
     return null;
   }
 }
 
-// ------------------------------------------------------
-// OTP GENERATOR
 // ------------------------------------------------------
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
 // ------------------------------------------------------
-// RULE-BASED FRAUD (FIRST PASS)
+// RULE ENGINE
 // ------------------------------------------------------
 async function ruleBasedFraud(client, event) {
   const amount = Number(event.amount);
 
-  // RULE — High-value withdrawal needs OTP
+  // 🔴 HIGH VALUE WITHDRAW
   if (event.type === "withdraw" && amount > 10000) {
+
+    // check existing valid OTP
+    const existingOtp = await client.query(
+      `SELECT id FROM otp_requests
+       WHERE event_id=$1
+       AND is_verified=false
+       AND expires_at > NOW()
+       LIMIT 1`,
+      [event.id]
+    );
+
+    if (existingOtp.rows.length > 0) {
+      console.log("⏸ Existing OTP still active. Waiting verification.");
+      return "OTP_PENDING";
+    }
+
+    // generate OTP
     const otp = generateOTP();
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
     await client.query(
-      `INSERT INTO otp_requests (event_id, account_id, amount, otp_code)
-       VALUES ($1, $2, $3, $4)`,
-      [event.id, event.account_id, amount, otp]
+      `INSERT INTO otp_requests
+       (event_id, account_id, amount, otp_code, expires_at)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [event.id, event.account_id, amount, otp, expiresAt]
     );
 
     console.log(`🔐 OTP generated for event ${event.id}:`, otp);
 
     await client.query(
       `INSERT INTO fraud_alerts (event_id, account_id, reason, severity)
-       VALUES ($1, $2, $3, $4)`,
-      [event.id, event.account_id, "Large withdrawal needs OTP", "critical"]
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (event_id) DO NOTHING`,
+      [event.id, event.account_id, "High-value withdrawal OTP required", "critical"]
     );
 
-    // Event stays in queue → but paused until OTP is verified
     return "OTP_PENDING";
   }
 
-  // RULE — Large deposit
-  if (event.type == "deposit" && amount > 5000) {
+  // 🔵 Large deposit alert
+  if (event.type === "deposit" && amount > 5000) {
     await client.query(
       `INSERT INTO fraud_alerts (event_id, account_id, reason, severity)
-       VALUES ($1, $2, $3, $4)`,
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (event_id) DO NOTHING`,
       [event.id, event.account_id, "Large deposit flagged", "high"]
     );
   }
 
-  // RULE — Burst activity
+  // 🟡 Burst activity
   const rapid = await client.query(
     `SELECT COUNT(*) FROM transactions
      WHERE account_id=$1 AND created_at > NOW() - INTERVAL '10 seconds'`,
@@ -85,8 +103,9 @@ async function ruleBasedFraud(client, event) {
   if (Number(rapid.rows[0].count) >= 5) {
     await client.query(
       `INSERT INTO fraud_alerts (event_id, account_id, reason, severity)
-       VALUES ($1, $2, $3, $4)`,
-      [event.id, event.account_id,"Burst activity detected", 'medium']
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (event_id) DO NOTHING`,
+      [event.id, event.account_id, "Burst activity detected", "medium"]
     );
   }
 
@@ -94,10 +113,10 @@ async function ruleBasedFraud(client, event) {
 }
 
 // ------------------------------------------------------
-// EXECUTE FINAL WITHDRAWAL
+// FINAL WITHDRAW AFTER OTP VERIFIED
 // ------------------------------------------------------
 async function executeVerifiedWithdrawal(client, event) {
-  console.log(`💡 OTP VERIFIED → executing withdrawal for event ${event.id}`);
+  console.log(`💡 OTP VERIFIED → executing withdrawal ${event.id}`);
 
   const amount = Number(event.amount);
 
@@ -107,9 +126,7 @@ async function executeVerifiedWithdrawal(client, event) {
   );
 
   const balance = Number(acc.rows[0].balance);
-  if (balance < amount) {
-    throw new Error("Insufficient balance during final execution.");
-  }
+  if (balance < amount) throw new Error("Insufficient balance.");
 
   const newBalance = balance - amount;
 
@@ -119,14 +136,14 @@ async function executeVerifiedWithdrawal(client, event) {
   );
 
   await client.query(
-    `INSERT INTO transactions (account_id, type, amount)
-     VALUES ($1, 'withdraw', $2)`,
+    `INSERT INTO transactions (account_id,type,amount)
+     VALUES ($1,'withdraw',$2)`,
     [event.account_id, amount]
   );
 }
 
 // ------------------------------------------------------
-// MAIN PROCESSOR LOOP
+// MAIN PROCESSOR
 // ------------------------------------------------------
 async function processNextEvent() {
   const client = await pool.connect();
@@ -147,51 +164,44 @@ async function processNextEvent() {
     }
 
     const event = result.rows[0];
-    console.log("⚡ Processing event:", event);
+    console.log("⚡ Processing:", event.id, event.type, event.amount);
 
     // --------------------------------------------------
-    // SECOND PASS — OTP VERIFIED
+    // OTP VERIFIED → EXECUTE
     // --------------------------------------------------
     if (event.is_otp_verified === true && event.type === "withdraw") {
       await executeVerifiedWithdrawal(client, event);
 
-      // remove event now
-      await client.query(`DELETE FROM transaction_events WHERE id=$1`, [
-        event.id,
-      ]);
-
+      await client.query(`DELETE FROM transaction_events WHERE id=$1`, [event.id]);
       await client.query("COMMIT");
-      console.log(`✔ Withdrawal completed for event ${event.id}`);
+
+      console.log(`✔ Withdrawal completed ${event.id}`);
       return true;
     }
 
-    
-
     // --------------------------------------------------
-    // FIRST PASS — ML SCORE
+    // ML SCORE
     // --------------------------------------------------
     const mlScore = await getMLScore(event);
 
-   if (mlScore !== null) {
-  // Upsert fraud score – never blow up on duplicate event_id
-  await client.query(
-    `INSERT INTO fraud_scores (event_id, account_id, score)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (event_id)
-     DO UPDATE SET score = EXCLUDED.score`,
-    [event.id, event.account_id, mlScore]
-  );
+    if (mlScore !== null) {
+      await client.query(
+        `INSERT INTO fraud_scores (event_id,account_id,score)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (event_id)
+         DO UPDATE SET score=EXCLUDED.score`,
+        [event.id, event.account_id, mlScore]
+      );
 
-  if (mlScore > 0.75) {
-    await client.query(
-      `INSERT INTO fraud_alerts (event_id, account_id, reason, severity)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (event_id) DO NOTHING`,
-      [event.id, event.account_id, 'ML anomaly score high', 'critical']
-    );
-  }
-}
-
+      if (mlScore > 0.75) {
+        await client.query(
+          `INSERT INTO fraud_alerts (event_id,account_id,reason,severity)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (event_id) DO NOTHING`,
+          [event.id, event.account_id, "ML anomaly detected", "critical"]
+        );
+      }
+    }
 
     // --------------------------------------------------
     // RULE ENGINE
@@ -200,27 +210,28 @@ async function processNextEvent() {
 
     if (ruleStatus === "OTP_PENDING") {
       await client.query("COMMIT");
-      console.log(`⏸ Event ${event.id} paused (waiting for OTP verification).`);
-      return true;
+      console.log(`⏸ Waiting OTP verification for ${event.id}`);
+      return false; // stop loop processing same event repeatedly
     }
 
-    // Normal event completion
+    // --------------------------------------------------
+    // NORMAL COMPLETE
+    // --------------------------------------------------
     await client.query(
       `INSERT INTO audit_logs (event_id, info)
-       VALUES ($1, $2)`,
+       VALUES ($1,$2)`,
       [event.id, `Completed ${event.type} ₹${event.amount}`]
     );
 
-    await client.query(`DELETE FROM transaction_events WHERE id=$1`, [
-      event.id,
-    ]);
-
+    await client.query(`DELETE FROM transaction_events WHERE id=$1`, [event.id]);
     await client.query("COMMIT");
-    console.log(`✔ Event ${event.id} fully processed.`);
+
+    console.log(`✔ Event processed ${event.id}`);
     return true;
+
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("❌ Worker error:", err);
+    console.error("❌ Worker error:", err.message);
     return false;
   } finally {
     client.release();
@@ -228,15 +239,16 @@ async function processNextEvent() {
 }
 
 // ------------------------------------------------------
-// CONTINUOUS LOOP
+// LOOP
 // ------------------------------------------------------
 async function loop() {
   while (true) {
     const ok = await processNextEvent();
-    if (!ok) await new Promise((r) => setTimeout(r, 1500));
+    if (!ok) await new Promise(r => setTimeout(r, 2000));
   }
 }
 
 loop();
+
 
 //docker exec -it banking-postgres psql -U postgres -d bank
